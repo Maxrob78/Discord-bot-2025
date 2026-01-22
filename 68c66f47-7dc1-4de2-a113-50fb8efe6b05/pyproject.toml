@@ -1,7 +1,7 @@
 [project]
-name = "python-template"
-version = "0.1.0"
+name = "MoneyBot"
+version = "2025.11.01"
 description = ""
-authors = ["Your Name <you@example.com>"]
+authors = ["Maxence robert"]
 requires-python = ">=3.11"
 dependencies = []
