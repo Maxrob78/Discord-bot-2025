@@ -4003,7 +4003,7 @@ async def objectif(ctx):
     await ctx.send(f"🎯 Ton objectif : **{objectif}**")
 
 
-API_KEY = "c16a7d1c38314ad589bc5c96649389fa"
+API_KEY = "TOKEN API twelvedata"
 
 SYMBOLS = ["AAPL", "MSFT", "TSLA", "GOOGL", "AMZN", "NVDA", "BRK.A"]
 PORTF_FILE = "portefeuille.json"
@@ -4582,4 +4582,4 @@ async def on_command_error(ctx, error):
         print(f"Erreur non gérée dans {ctx.command}: {error}")
 
 
-bot.run("TOKEN")
+bot.run("TOKEN DISCORD")
