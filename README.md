@@ -22,12 +22,6 @@ Un algorithme avancé gère les résultats des matchs en prenant en compte plusi
 * **Facteurs dynamiques :** Forme du moment, avantage à domicile, et gestion des blessures.
 * **Aléatoire contrôlé :** Simulation fidèle à l'imprévisibilité du football réel.
 
-### 🎨 Design & Montage Automatisé
-Génération instantanée de visuels pour dynamiser la vie du serveur :
-* **Feuilles de match :** Création de compositions graphiques avant le coup d'envoi.
-* **Cartes de joueurs :** Génération de cartes de statistiques personnalisées (style FUT).
-* **Annonces de résultats :** Tableaux de scores stylisés prêts à être partagés.
-
 ---
 
 ## 🛠️ Stack Technique
