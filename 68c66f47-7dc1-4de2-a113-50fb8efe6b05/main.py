@@ -1,14 +1,16 @@
 import discord
 from discord.ext import commands
 import json
-import os
-import random
 import asyncio
 from math import ceil
 import unicodedata
 from difflib import SequenceMatcher
 from collections import Counter
+import numpy as np
+import re
 import random
+import os
+import io
 import datetime
 from datetime import date
 from discord.ui import View, Button
@@ -30,6 +32,567 @@ BALANCES_FILE = "balances.json"
 PLAYERS_FOR_SALE_FILE = "players_for_sale.json"
 JOUEURS_POSSEDES_FILE = "joueurs_possedes.json"
 
+
+OCR_API_KEY = 'CLEE_API' 
+
+from collections import Counter
+
+import requests
+import re
+import asyncio
+from io import BytesIO
+from PIL import Image, ImageEnhance
+
+# --- 0. FONCTION DE COMPRESSION RAPIDE (V2 LIGHT) ---
+def quick_compress(img_bytes):
+    try:
+        img = Image.open(BytesIO(img_bytes))
+        
+        # Conversion en RGB
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+            
+        # REDIMENSIONNEMENT AGRESSIF (Max 1000px de large ou haut)
+        # Ça réduit le poids de 3MB à 150KB en une fraction de seconde
+        img.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
+        
+        output = BytesIO()
+        # Qualité 85 standard
+        img.save(output, format='JPEG', quality=85, optimize=True)
+        return output.getvalue()
+    except Exception as e:
+        print(f"⚠️ Erreur Compression: {e}")
+        return img_bytes # On renvoie l'original si échec
+
+# --- 1. NETTOYAGE NOM (TON CODE D'ORIGINE) ---
+def clean_name(text):
+    if not text: return ""
+    # Enlève les motifs type (17), [12], {7}, #17
+    text = re.sub(r'[(\[\{#]\s*\d+\s*[)\]\}]', '', text)
+    # Enlève les nombres isolés (ex: "MBAPPE 7" devient "MBAPPE")
+    text = re.sub(r'\b\d+\b', '', text)
+    # Nettoyage agressif des parasites habituels
+    text = re.sub(r'(GEN|I|\||:|;)', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s+\d+$', '', text)
+    text = re.sub(r'^\d+\s+', '', text)
+    
+    t = re.sub(r'[^\w\s.\-]', '', text, flags=re.UNICODE).strip()
+    
+    blacklist = ["VS", "SUB", "LINEUP11", "LINEUP","ALINUP","LNUP","LNEUP","A LNUP","Profl", "LINUP", "MG", "AG", "MOC", "AD", "DG", "DC", "DD", "MC", "MDC", "BU", "AT", "GK", "SPORTS STUDIO", "ANDROID", "IOS", "APP", "STORE", "LIBRE", "HGAME", "GOOGLE PLAY","MALHÃO"]
+    
+    if t.isdigit(): return "" 
+    if len(t) < 2: return ""
+    if t.upper() in blacklist: return ""
+    if re.match(r'^[\d\s]+$', t): return "" 
+    return t
+
+# --- 2. SCAN HYBRIDE RAPIDE (V2 LIGHT) ---
+async def fuzzy_scan_api(image_url):
+    loop = asyncio.get_event_loop()
+    
+    # 1. TÉLÉCHARGEMENT & COMPRESSION RAPIDE
+    try:
+        # Timeout téléchargement court (10s)
+        response = await loop.run_in_executor(None, lambda: requests.get(image_url, timeout=10))
+        img_bytes = await loop.run_in_executor(None, lambda: quick_compress(response.content))
+    except Exception as e:
+        print(f"❌ Erreur Download: {e}")
+        return [{"name": f"Pnj-{i}", "rating": 70, "pos": "MC", "y":0} for i in range(11)], "Équipe Illisible"
+
+    # 2. CONFIGURATION API
+    payload = {
+        'apikey': OCR_API_KEY, # Assure-toi que cette variable est définie plus haut, sinon mets 'helloworld'
+        'language': 'eng',
+        'isOverlayRequired': True,
+        'scale': True, # Important car on a réduit l'image
+        'OCREngine': 2
+    }
+
+    # 3. ENVOI UNIQUE (Pas de boucle, pas de retry, Timeout 20s)
+    print("📤 Envoi OCR vers API...")
+    result = None
+    try:
+        def send_request():
+            files = {'file': ('image.jpg', img_bytes, 'image/jpeg')}
+            # TIMEOUT STRICT DE 20 SECONDES
+            return requests.post('https://api.ocr.space/parse/image', files=files, data=payload, timeout=20)
+
+        r = await loop.run_in_executor(None, send_request)
+        if r.status_code == 200:
+            result = r.json()
+        else:
+            print(f"⚠️ Erreur HTTP: {r.status_code}")
+
+    except Exception as e:
+        print(f"⚠️ Timeout API ou Erreur Reseau: {e}")
+        # En cas de timeout, on retourne une équipe par défaut immédiatement
+        return [{"name": f"Joueur-{i}", "rating": 70, "pos": "MC", "y":0} for i in range(11)], "Timeout OCR"
+
+    # 4. ANALYSE DU RÉSULTAT
+    if not result or result.get('OCRExitCode') != 1:
+        err = result.get('ErrorMessage') if result else "Pas de réponse"
+        print(f"❌ Erreur API: {err}")
+        return [{"name": f"Joueur-{i}", "rating": 70, "pos": "MC", "y":0} for i in range(11)], "Erreur OCR"
+
+    # 5. PARSING (TON CODE INTELLIGENT CONSERVÉ)
+    try:
+        lines = result['ParsedResults'][0]['TextOverlay']['Lines']
+        
+        # === PLAN A : SCAN SPATIAL ===
+        players_spatial = []
+        anchors = []
+        
+        for line in lines:
+            if not line.get('Words'): continue 
+            text = line['LineText'].strip()
+            match = re.search(r'([4-9][0-9])', text)
+            if match and len(re.findall(r'\d', text)) <= 4:
+                anchors.append({'rating': int(match.group(1)), 'y': line['Words'][0]['Top'], 'x': line['Words'][0]['Left'] + (line['Words'][0]['Width']/2), 'text': text})
+
+        used_lines = set()
+        for anchor in anchors:
+            best = None
+            min_cost = float('inf')
+            for i, line in enumerate(lines):
+                if i in used_lines or not line.get('Words'): continue
+                dist_y = anchor['y'] - line['Words'][0]['Top']
+                dist_x = abs((line['Words'][0]['Left'] + (line['Words'][0]['Width']/2)) - anchor['x'])
+                
+                if 0 < dist_y < 350 and dist_x < 150:
+                    cleaned = clean_name(line['LineText'])
+                    if cleaned:
+                        cost = dist_y + (dist_x * 2.5)
+                        if cost < min_cost:
+                            min_cost = cost
+                            best = {'name': cleaned, 'index': i}
+            
+            if best:
+                pos = "JOUEUR"
+                for p in ['GK', 'BU', 'AT', 'AG', 'AD', 'MOC', 'MC', 'MDC', 'DG', 'DD', 'DC']:
+                    if p in anchor['text'].upper(): pos = p; break
+                players_spatial.append({'name': best['name'], 'rating': anchor['rating'], 'pos': pos, 'y': anchor['y']})
+                used_lines.add(best['index'])
+
+        # === PLAN B : SCAN LINÉAIRE ===
+        final_players = players_spatial
+        if len(players_spatial) < 7:
+            players_linear = []
+            for i in range(1, len(lines)):
+                current_line = lines[i]['LineText'].strip()
+                match = re.search(r'([4-9][0-9])', current_line)
+                if match and len(re.findall(r'\d', current_line)) <= 4:
+                    prev_line = lines[i-1]['LineText']
+                    name = clean_name(prev_line)
+                    if name:
+                        pos = "JOUEUR"
+                        for p in ['GK', 'BU', 'AT', 'AG', 'AD', 'MOC', 'MC', 'MDC', 'DG', 'DD', 'DC']:
+                            if p in current_line.upper(): pos = p; break
+                        y_pos = lines[i]['Words'][0]['Top'] if lines[i].get('Words') else 0
+                        players_linear.append({'name': name, 'rating': int(match.group(1)), 'pos': pos, 'y': y_pos})
+            
+            if len(players_linear) > len(players_spatial): final_players = players_linear
+
+        # Nettoyage et Remplissage
+        final_players.sort(key=lambda x: x['rating'], reverse=True)
+        unique_roster = []
+        seen = set()
+        for p in final_players:
+            n = p['name'].upper().replace('.', '').strip()
+            if n not in seen:
+                unique_roster.append(p)
+                seen.add(n)
+
+        while len(unique_roster) < 11:
+            unique_roster.append({'name': f"Inconnu-{len(unique_roster)+1}", 'rating': 70, 'pos': 'MC', 'y': 0})
+        
+        roster = unique_roster[:11]
+        roster.sort(key=lambda p: p['y'], reverse=True)
+        if roster: roster[0]['pos'] = "GK"
+        roster.sort(key=lambda p: p['rating'], reverse=True)
+
+        # Team Name (Logique conservée)
+        full_text = " ".join([l['LineText'] for l in lines]).upper()
+        if "PIG" in full_text: team_name = "PIG FC"
+        elif "AC SLIME" in full_text: team_name = "AC SLIME"
+        elif "TIGRE" in full_text: team_name = "TIGRE FC"
+        elif "CALAMAR" in full_text: team_name = "FC CALAMAR"
+        elif "PNJ" in full_text: team_name = "FC PNJ"
+        elif "OM" in full_text: team_name = "OLYMPIQUE MOUTON"
+        else:
+            team_name = "Équipe"
+            sorted_by_y = sorted(lines, key=lambda l: l['Words'][0]['Top'] if l.get('Words') else 0)
+            for line in sorted_by_y[-5:]:
+                t = clean_name(line['LineText'])
+                if len(t) > 3 and "LINUP" not in t.upper() and "LINEUP" not in t.upper():
+                    team_name = t
+
+        return roster, team_name
+
+    except Exception as e:
+        print(f"⚠️ Erreur Parsing: {e}")
+        return [{"name": f"Pnj-{i}", "rating": 70, "pos": "MC", "y":0} for i in range(11)], "Équipe Buggée"
+
+import numpy as np
+import random
+import math
+
+# ==========================================
+# CLASSE JOUEUR (Légèrement ajustée)
+# ==========================================
+class SmartPlayerV2:
+    def __init__(self, ocr_data):
+        self.name = ocr_data.get('name', 'Inconnu')
+        self.rating = ocr_data.get('rating', 75)
+        self.raw_pos = ocr_data.get('pos', 'JOUEUR').upper()
+        self.role = self._map_role(self.raw_pos)
+        
+        # Stats fixes (Potentiel)
+        self.base_stats = self._derive_attributes_advanced()
+        
+        # Stats dynamiques
+        self.current_stamina = 100.0
+        self.form = np.random.normal(0, 2)
+        
+        # Trackers
+        self.goals = 0
+        self.assists = 0
+        self.shots = 0
+        self.passes_ok = 0
+        self.tackles_ok = 0
+        self.saves = 0
+        self.rating_match = 6.0 
+
+    def _map_role(self, pos):
+        if any(x in pos for x in ['GK', 'GB']): return 'GK'
+        if any(x in pos for x in ['DC', 'CB']): return 'CB'
+        if any(x in pos for x in ['DD', 'DG', 'LB', 'RB', 'RWB', 'LWB']): return 'FB'
+        if any(x in pos for x in ['MDC', 'CDM']): return 'CDM'
+        if any(x in pos for x in ['MOC', 'CAM', 'BU', 'AT', 'ST', 'CF']): return 'ATT'
+        return 'MID'
+
+    def _derive_attributes_advanced(self):
+        # ... (Garder ta logique d'archétypes ici, elle est très bien) ...
+        # Pour l'exemple, je remets le code simplifié mais garde le tien
+        stats = {
+            'finishing': np.random.normal(self.rating - 30, 5),
+            'passing': np.random.normal(self.rating - 10, 5),
+            'defense': np.random.normal(self.rating - 30, 5),
+            'physical': np.random.normal(self.rating - 10, 5),
+            'iq': np.random.normal(self.rating, 2),
+            'reflexes': 10
+        }
+        if self.role == 'GK':
+            stats['reflexes'] = self.rating
+            stats['passing'] = self.rating - 20
+        elif self.role == 'ATT':
+            stats['finishing'] = self.rating + 5
+            stats['defense'] = 25
+        elif self.role == 'CB':
+            stats['defense'] = self.rating + 5
+            stats['finishing'] = 20
+
+        for k in stats: stats[k] = max(1, min(99, stats[k]))
+        return stats
+
+    def get_live_stat(self, stat_name):
+        base = self.base_stats.get(stat_name, 50)
+        # La fatigue impacte moins violemment pour éviter l'effondrement en fin de match
+        # Mais reste présente
+        fatigue_penalty = (100 - self.current_stamina) * 0.15 
+        val = base + self.form - fatigue_penalty
+        return max(1, val)
+
+# ==========================================
+# MOTEUR DE SIMULATION REALISTE V4
+# ==========================================
+class RealisticMatchEngine:
+    def __init__(self, roster_a, name_a, roster_b, name_b):
+        # Fallback ghosts si listes vides
+        if not roster_a: roster_a = [{'name': 'Ghost-A', 'rating': 70, 'pos': 'MC'}] * 11
+        if not roster_b: roster_b = [{'name': 'Ghost-B', 'rating': 70, 'pos': 'MC'}] * 11
+
+        self.team_a = [SmartPlayerV2(p) for p in roster_a]
+        self.team_b = [SmartPlayerV2(p) for p in roster_b]
+        self.name_a = name_a
+        self.name_b = name_b
+        
+        self.tactic_a = self._analyze_tactic(self.team_a)
+        self.tactic_b = self._analyze_tactic(self.team_b)
+        
+        self.score = {'A': 0, 'B': 0}
+        self.stats = {'A': {'poss': 0, 'xG': 0.0, 'shots': 0, 'on_target': 0}, 
+                      'B': {'poss': 0, 'xG': 0.0, 'shots': 0, 'on_target': 0}}
+        # On garde events juste pour le debug si besoin, mais on ne l'affiche plus
+        self.events = []
+
+    def _analyze_tactic(self, roster):
+        avg_pass = np.mean([p.base_stats['passing'] for p in roster])
+        return "TIKI_TAKA" if avg_pass > 82 else "DIRECT"
+
+    def _sigmoid_duel(self, val_atk, val_def, variance=15.0):
+        diff = val_atk - val_def
+        return 1 / (1 + math.exp(-diff / variance))
+
+    def simulate(self):
+        for minute in range(1, 96):
+            self._simulate_minute(minute)
+        return self._generate_report()
+
+    def _simulate_minute(self, minute):
+        # 1. URGENCE & MILIEU
+        score_diff = self.score['A'] - self.score['B']
+        urgency_a = 1.0 + (0.1 if minute > 80 and score_diff < 0 else 0)
+        urgency_b = 1.0 + (0.1 if minute > 80 and score_diff > 0 else 0)
+
+        mids_a = [p for p in self.team_a if p.role in ['MID', 'CDM']]
+        mids_b = [p for p in self.team_b if p.role in ['MID', 'CDM']]
+        
+        # SÉCURITÉ ANTI-CRASH : Si pas de milieux trouvés, on prend toute l'équipe
+        if not mids_a: mids_a = self.team_a
+        if not mids_b: mids_b = self.team_b
+
+        mid_val_a = np.mean([p.get_live_stat('passing') for p in mids_a]) * urgency_a
+        mid_val_b = np.mean([p.get_live_stat('passing') for p in mids_b]) * urgency_b
+        
+        possessor = 'A' if (mid_val_a - mid_val_b + np.random.normal(0, 10)) > 0 else 'B'
+        
+        self.stats[possessor]['poss'] += 1
+        att_team = self.team_a if possessor == 'A' else self.team_b
+        def_team = self.team_b if possessor == 'A' else self.team_a
+        
+        # Fatigue
+        for p in att_team + def_team: p.current_stamina = max(0, p.current_stamina - 0.08)
+
+        # ETAPE A : CONSTRUCTION
+        if not att_team: return
+        passer = random.choice(att_team) # Celui qui fait la passe décisive potentielle
+        
+        def_block_rating = np.mean([d.get_live_stat('defense') for d in def_team])
+        penetration_prob = self._sigmoid_duel(passer.get_live_stat('passing'), def_block_rating, 20)
+        
+        # Filtre Possession stérile
+        if random.random() > (penetration_prob * 0.35):
+            return 
+
+        # ETAPE B : LA DERNIÈRE PASSE (SÉCURISÉE)
+        # On cherche un attaquant, sinon on prend n'importe qui sauf le Goal
+        potential_strikers = [p for p in att_team if p.role in ['ATT', 'MID']]
+        if not potential_strikers: potential_strikers = [p for p in att_team if p.role != 'GK'] or att_team
+        striker = random.choice(potential_strikers)
+
+        # On cherche un défenseur, sinon n'importe qui
+        potential_defenders = [p for p in def_team if p.role in ['CB', 'FB', 'CDM']]
+        if not potential_defenders: potential_defenders = [p for p in def_team if p.role != 'GK'] or def_team
+        defender = random.choice(potential_defenders)
+        
+        pass_success = self._sigmoid_duel(passer.get_live_stat('passing'), defender.get_live_stat('iq'), 15)
+        
+        # Si passe ratée
+        if random.random() > pass_success:
+            defender.tackles_ok += 1
+            defender.rating_match += 0.1
+            return 
+
+        # ETAPE C : TIRS
+        striker.shots += 1
+        self.stats[possessor]['shots'] += 1
+        
+        base_xg = np.random.beta(2, 10) 
+        duel_bonus = (striker.get_live_stat('physical') - defender.get_live_stat('physical')) / 200
+        xg = max(0.01, min(0.99, base_xg + duel_bonus))
+        self.stats[possessor]['xG'] += xg
+
+        # ETAPE D : FINITION
+        # Sécurité Goal
+        potential_gks = [p for p in def_team if p.role == 'GK']
+        def_gk = potential_gks[0] if potential_gks else def_team[0]
+        
+        # Cadré ?
+        on_target_prob = 0.30 + (striker.get_live_stat('finishing') / 200) + (xg * 0.5)
+        if random.random() > on_target_prob:
+            striker.rating_match -= 0.1
+            return
+
+        self.stats[possessor]['on_target'] += 1
+        
+        # Duel But
+        gk_factor = def_gk.get_live_stat('reflexes') / 100.0
+        shooter_factor = striker.get_live_stat('finishing') / 100.0
+        effective_xg = xg * (1 + (shooter_factor - gk_factor))
+        
+# ==============================================================================
+        # LOGIQUE DE NOTATION RÉALISTE (Basée sur xG comme Sofascore/WhoScored)
+        # ==============================================================================
+        
+        if random.random() < effective_xg:
+            # === BUT ! ===
+            self.score[possessor] += 1
+            striker.goals += 1
+            
+            # --- BONUS BUTEUR ---
+            # Un but difficile (faible xG) rapporte plus de points (Exploit)
+            # Base +1.0, mais si xG < 0.10 (but incroyable), on ajoute +0.3
+            goal_bonus = 1.0 + (0.3 if xg < 0.15 else 0)
+            striker.rating_match += goal_bonus
+            
+            # --- BONUS PASSEUR ---
+            if passer != striker:
+                passer.assists += 1
+                # Une passe D vaut cher (entre 0.5 et 0.8)
+                passer.rating_match += 0.6 
+                
+            # --- MALUS GARDIEN (SUBTILITÉ) ---
+            # Si le tir était imparable (xG élevé), on punit moins le gardien.
+            # Si le tir était facile (xG faible), c'est une boulette -> grosse punition.
+            if xg > 0.60:
+                gk_penalty = 0.5 # Tir imparable, pas trop sa faute
+            elif xg < 0.15:
+                gk_penalty = 1.2 # Boulette ! Il aurait dû l'avoir
+            else:
+                gk_penalty = 0.7 # But standard
+            
+            def_gk.rating_match -= gk_penalty
+            
+            # (Optionnel) Petit malus collectif pour les défenseurs (-0.1)
+            for d in def_team: 
+                if d.role in ['CB', 'FB', 'CDM'] and d != def_gk:
+                    d.rating_match -= 0.15
+
+            self.events.append(f"⚽ {minute}' {striker.name} (xG: {xg:.2f})")
+            
+        else:
+            # === ARRÊT DU GARDIEN ===
+            def_gk.saves += 1
+            
+            # --- BONUS GARDIEN ---
+            # Arrêt réflexe sur grosse occasion (xG élevé) = Gros bonus
+            # Arrêt facile (xG faible) = Tout petit bonus (pour éviter le 10/10)
+            if xg > 0.40:
+                save_bonus = 0.6 # "Big Save"
+            elif xg > 0.15:
+                save_bonus = 0.2 # Arrêt standard
+            else:
+                save_bonus = 0.05 # Arrêt facile (tir mou), ça ne mérite pas de points
+                
+            def_gk.rating_match += save_bonus
+            
+            # --- MALUS ATTAQUANT (RATÉ) ---
+            # Si c'était une grosse occasion (xG > 0.50) et qu'il rate -> Malus "Gros raté"
+            if xg > 0.50:
+                striker.rating_match -= 0.3
+            else:
+                pass
+
+    def _generate_report(self):
+        total_poss = max(1, self.stats['A']['poss'] + self.stats['B']['poss'])
+        
+        # MVP
+        all_players = self.team_a + self.team_b
+        mvp = max(all_players, key=lambda p: p.rating_match)
+        
+        # --- NOUVELLE SECTION : BUTEURS & PASSEURS ---
+        def get_scorers_text(team):
+            # Récupère ceux qui ont marqué
+            scorers = [f"{p.name} ({p.goals})" for p in team if p.goals > 0]
+            if not scorers: return "Aucun"
+            return ", ".join(scorers)
+
+        def get_assisters_text(team):
+            # Récupère ceux qui ont fait une passe D
+            assisters = [f"{p.name} ({p.assists})" for p in team if p.assists > 0]
+            if not assisters: return "Aucun"
+            return ", ".join(assisters)
+
+        return {
+            "result": {
+                "score_a": self.score['A'],
+                "score_b": self.score['B'],
+                "winner": self.name_a if self.score['A'] > self.score['B'] else (self.name_b if self.score['B'] > self.score['A'] else "Nul")
+            },
+            "stats": {
+                "poss_a": round(self.stats['A']['poss']/total_poss*100),
+                "poss_b": round(self.stats['B']['poss']/total_poss*100),
+                "xg_a": round(self.stats['A']['xG'], 2),
+                "xg_b": round(self.stats['B']['xG'], 2),
+                "shots_a": self.stats['A']['shots'],
+                "shots_b": self.stats['B']['shots']
+            },
+            "details": {
+                "scorers_a": get_scorers_text(self.team_a),
+                "scorers_b": get_scorers_text(self.team_b),
+                "assists_a": get_assisters_text(self.team_a),
+                "assists_b": get_assisters_text(self.team_b)
+            },
+            "mvp": {"name": mvp.name, "rating": round(min(10, mvp.rating_match), 1), "team": "A" if mvp in self.team_a else "B"}
+        }
+@bot.command()
+async def matchsim(ctx):
+    # 1. Vérif images
+    if len(ctx.message.attachments) < 2:
+        return await ctx.send("📷 Il faut 2 images pour simuler un match !")
+    
+    m = await ctx.send("🔍 **Analyse des équipes & Simulation en cours...**")
+
+    # 2. OCR (Récupération des équipes)
+    # Assure-toi que ta fonction fuzzy_scan_api est bien définie ailleurs
+    roster_a, name_a = await fuzzy_scan_api(ctx.message.attachments[0].url)
+    roster_b, name_b = await fuzzy_scan_api(ctx.message.attachments[1].url)
+
+    # 3. Simulation
+    engine = RealisticMatchEngine(roster_a, name_a, roster_b, name_b)
+    report = engine.simulate()
+    
+    res = report['result']
+    stats = report['stats']
+    details = report['details']
+    mvp = report['mvp']
+
+    # 4. Barre de possession visuelle
+    blocks = int(stats['poss_a'] / 10) 
+    progress_bar = "🟦" * blocks + "🟥" * (10 - blocks)
+
+    # 5. Construction de l'Embed
+    e = discord.Embed(
+        title=f"🏟️ {name_a} vs {name_b}", 
+        description=f"# {res['score_a']} - {res['score_b']}", 
+        color=0x2ecc71
+    )
+    
+    # Statistiques du match
+    stats_content = (
+        f"**Possession:** {stats['poss_a']}% {progress_bar} {stats['poss_b']}%\n"
+        f"**Tirs:** {stats['shots_a']} - {stats['shots_b']}\n"
+        f"**xG:** {stats['xg_a']} - {stats['xg_b']}"
+    )
+    e.add_field(name="📊 Stats Match", value=stats_content, inline=False)
+
+    # Section Buteurs (Team A)
+    if details['scorers_a'] != "Aucun":
+        e.add_field(name=f"⚽ Buts {name_a}", value=details['scorers_a'], inline=True)
+    
+    # Section Buteurs (Team B)
+    if details['scorers_b'] != "Aucun":
+        e.add_field(name=f"⚽ Buts {name_b}", value=details['scorers_b'], inline=True)
+
+    # Ligne vide pour forcer le saut de ligne si besoin
+    e.add_field(name="\u200b", value="\u200b", inline=False)
+
+    # Section Passeurs (Team A)
+    if details['assists_a'] != "Aucun":
+        e.add_field(name=f"🎯 Passes {name_a}", value=details['assists_a'], inline=True)
+
+    # Section Passeurs (Team B)
+    if details['assists_b'] != "Aucun":
+        e.add_field(name=f"🎯 Passes {name_b}", value=details['assists_b'], inline=True)
+
+    # MVP
+    mvp_emoji = "🟦" if mvp['team'] == "A" else "🟥"
+    e.add_field(name="⭐ Homme du Match", value=f"{mvp_emoji} **{mvp['name']}** ({mvp['rating']}/10)", inline=False)
+    
+    e.set_footer(text="Simulation Réaliste V4.2")
+
+    await m.delete()
+    await ctx.send(embed=e)
 
 # Charger les joueurs possédés
 def load_owned_players():
@@ -125,67 +688,6 @@ async def viewsolde(ctx, membre: discord.Member):
     bal_formatted = format_money(bal)
     await ctx.send(f"{membre.display_name} a un solde de {bal_formatted} €.")
 
-
-@bot.command()
-async def kebab(ctx):
-    user_id = str(ctx.author.id)
-    balances = load_balances()
-
-    if balances.get(user_id, 0) < 8:
-        await ctx.send(
-            "❌ Tu n'as pas assez d'argent pour acheter un kebab (8 €).")
-        return
-
-    balances[user_id] -= 8
-    save_balances(balances)
-    formatted_solde = format_money(balances[user_id])
-    await ctx.send(
-        f"🌯 {ctx.author.display_name} a acheté un kebab pour 8 € ! Il lui reste {formatted_solde} €."
-    )
-
-
-@bot.command(name="envoyerkebab")
-async def envoyer_kebab(ctx, membre: discord.Member):
-    emetteur_id = str(ctx.author.id)
-    receveur_id = str(membre.id)
-    balances = load_balances()
-
-    if balances.get(emetteur_id, 0) < 8:
-        await ctx.send(
-            "❌ Tu n'as pas assez d'argent pour offrir un kebab (8 €).")
-        return
-
-    balances[emetteur_id] -= 8
-    balances[receveur_id] = balances.get(receveur_id, 0) + 8
-
-    save_balances(balances)
-    solde_emetteur = format_money(balances[emetteur_id])
-
-    await ctx.send(
-        f"🌯 {ctx.author.display_name} a offert un kebab à {membre.display_name} pour 8 € !\nIl lui reste {solde_emetteur} €."
-    )
-
-
-@bot.command(name="nb_kebab")
-async def kebabs(ctx, membre: discord.Member = None):
-    if membre is None:
-        membre = ctx.author
-
-    user_id = str(membre.id)
-    balances = load_balances()
-    solde = balances.get(user_id, 0)
-    nb_kebabs = solde // 8
-
-    solde_formate = format_money(solde)
-
-    if membre == ctx.author:
-        await ctx.send(
-            f"Tu as {solde_formate} €, tu peux acheter **{nb_kebabs} kebabs** 🌯."
-        )
-    else:
-        await ctx.send(
-            f"{membre.display_name} a {solde_formate} €, il peut acheter **{nb_kebabs} kebabs** 🌯."
-        )
 
 with open("inventaires.json", "r", encoding="utf-8") as f:
     content = f.read()
@@ -856,6 +1358,49 @@ quiz_questions = [
     ("Quel gaz les plantes absorbent-elles pour faire la photosynthèse ?",
      "co2"),
     ("Combien de couleurs y a-t-il dans un arc-en-ciel ?", "7"),
+    
+    # Histoire / Géographie
+    ("Quelle est la capitale du Canada ?", "Ottawa"),
+    ("En quelle année est tombé le mur de Berlin ?", "1989"),
+    ("Quel est le plus vaste pays du monde ?", "Russie"),
+    ("Qui a découvert l'Amérique en 1492 ?", ["Christophe Colomb", "Colomb"]),
+    ("Quel est le plus long fleuve du monde ?", ["Amazone", "L'Amazone"]),
+
+    # Sciences / Chimie / Physique
+    ("Quel est l'élément chimique dont le symbole est Cu ?", "cuivre"),
+    ("Quelle planète est la plus proche du Soleil ?", "Mercure"),
+    ("Quelle est la vitesse de la lumière (en km/s) ?", "300000"),
+    ("Qui a découvert la pénicilline ?", "Alexander Fleming"),
+    ("Quelle est l'unité de mesure de la force ?", "Newton"),
+
+    # Mathématiques
+    ("Comment appelle-t-on un polygone à 5 côtés ?", "pentagone"),
+    ("Quelle est la valeur de pi arrondie à deux décimales ?", "3,14"),
+    ("Que vaut le sinus d'un angle de 90 degrés ?", "1"),
+    ("Combien de degrés y a-t-il dans un angle droit ?", "90"),
+    ("Quel est le résultat de 2 à la puissance 5 ?", "32"),
+
+    # Culture générale
+    ("Qui a peint 'Le Cri' ?", "Edvard Munch"),
+    ("Quel pays a offert la Statue de la Liberté aux États-Unis ?", "France"),
+    ("Quel est le nom du détective créé par Arthur Conan Doyle ?", "Sherlock Holmes"),
+    ("Dans quelle ville se trouve la Sagrada Família ?", "Barcelone"),
+    ("Quel instrument de musique est associé à Miles Davis ?", "trompette"),
+
+    # Sport (Football et divers)
+    ("Qui a remporté l'Euro 2024 ?", "Espagne"),
+    ("Quel club a remporté la Ligue des Champions 2024 ?", "Real Madrid"),
+    ("Dans quel pays s'est déroulée la Coupe du Monde 2022 ?", "Qatar"),
+    ("Qui est le sélectionneur de l'équipe de France masculine en 2024 ?", "Didier Deschamps"),
+    ("Quel joueur de tennis détient le record de victoires à Roland-Garros ?",["Rafael Nadal", "Nadal"]),
+    ("Combien de points vaut un essai au rugby (sans transformation) ?", "5"),
+
+    # Divers
+    ("Quel est le plus petit pays du monde ?", "Vatican"),
+    ("Quel fruit utilise-t-on pour faire du cidre ?", "pomme"),
+    ("Combien de cœurs possède une pieuvre ?", "3"),
+    ("Quelle est la monnaie officielle du Japon ?", "yen"),
+    ("Quelle est la langue la plus parlée au monde (en nombre de locuteurs natifs) ?", "mandarin"),
 ]
 
 # Variable globale pour stocker les quiz en cours
@@ -895,10 +1440,11 @@ def is_correct(user_input: str, answer):
 @bot.command()
 async def quiz(ctx, rounds: int = 3):
     channel_id = ctx.channel.id
-
+    if rounds > 10:
+        rounds = 10
     if channel_id in quiz_en_cours:
-        await ctx.send("⚠ Un quiz est déjà en cours dans ce salon ! Patiente un peu...")
-        return
+    	await ctx.send("⚠ Un quiz est déjà en cours dans ce salon ! Patiente un peu...")
+    	return
 
     quiz_en_cours[channel_id] = True
     await ctx.send(f"🎮 **Début du quiz !** Meilleur sur {rounds} questions gagne le pactole !")
@@ -4003,7 +4549,7 @@ async def objectif(ctx):
     await ctx.send(f"🎯 Ton objectif : **{objectif}**")
 
 
-API_KEY = "TOKEN API twelvedata"
+API_KEY = "CLEEAPI_TWELVEDATA"
 
 SYMBOLS = ["AAPL", "MSFT", "TSLA", "GOOGL", "AMZN", "NVDA", "BRK.A"]
 PORTF_FILE = "portefeuille.json"
@@ -4582,4 +5128,4 @@ async def on_command_error(ctx, error):
         print(f"Erreur non gérée dans {ctx.command}: {error}")
 
 
-bot.run("TOKEN DISCORD")
+bot.run("CLEE_API_DISCORD")
